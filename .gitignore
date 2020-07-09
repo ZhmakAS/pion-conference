@@ -1,0 +1,11 @@
+.idea
+.vscode
+
+*.dll
+*.exe
+*.o
+*.so
+*.a
+*.log
+
+!/vendor
