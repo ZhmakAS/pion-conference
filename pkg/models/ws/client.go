@@ -14,8 +14,9 @@ type Client struct {
 	id   string
 	conn *websocket.Conn
 
-	err error
-	mux sync.RWMutex
+	metadata string
+	err      error
+	mux      sync.RWMutex
 }
 
 func NewClientWithID(conn *websocket.Conn, id string) Client {
@@ -23,9 +24,18 @@ func NewClientWithID(conn *websocket.Conn, id string) Client {
 		id = uuid.New().String()
 	}
 	return Client{
-		id:   id,
-		conn: conn,
+		id:       id,
+		conn:     conn,
+		metadata: "ivan",
 	}
+}
+
+func (c *Client) SetMetadata(metadata string) {
+	c.metadata = metadata
+}
+
+func (c *Client) Metadata() string {
+	return c.metadata
 }
 
 func (c *Client) Listen() <-chan Message {

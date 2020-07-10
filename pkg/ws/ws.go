@@ -2,10 +2,10 @@ package ws
 
 import (
 	"log"
-	"pion-conference/pkg/models/api "
+	"pion-conference/pkg/models/api"
 	"pion-conference/pkg/models/ws"
+	"pion-conference/pkg/webrtc/track"
 )
-
 
 type (
 	Subscription struct {
@@ -17,6 +17,11 @@ type (
 
 	Service struct {
 		rooms *RoomsService
+	}
+
+	MetadataPayload struct {
+		UserID   string           `json:"userId"`
+		Metadata []track.Metadata `json:"metadata"`
 	}
 
 	wsContext struct {
@@ -37,7 +42,7 @@ func (s *Service) Subscribe(enter api.WsRoomEnter) (*Subscription, error) {
 	msg := make(chan ws.Message)
 
 	roomCtrl := s.rooms.SetRoomController(enter.RoomId)
-	client := ws.NewClientWithID(enter.Conn, enter.RoomId)
+	client := ws.NewClientWithID(enter.Conn, enter.ClientId)
 
 	roomCtrl.Add(client)
 

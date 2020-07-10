@@ -3,45 +3,81 @@ package webrtc
 import (
 	"errors"
 	"fmt"
+	"github.com/pion/rtcp"
+	"github.com/pion/webrtc/v3"
 	"io"
 	"log"
+	"pion-conference/pkg/webrtc/track"
 	"sync"
-	"time"
-
-	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
 )
 
 type Connector struct {
-	mu sync.Mutex
-	wg sync.WaitGroup
+	mux sync.Mutex
+	wg  sync.WaitGroup
 
 	clientID       string
 	peerConnection *webrtc.PeerConnection
 
-	trackEventsCh chan TrackEvent
-	rtpStream     chan *rtp.Packet
+	signalService *SignalService
+	trackEvents   chan track.Event
+	rtcpStream    chan rtcp.Packet
+
+	localTracks []*webrtc.Track
 }
 
 func NewConnector(clientId string) (*Connector, error) {
+	var mediaEngine webrtc.MediaEngine
+
+	mediaEngine.RegisterCodec(webrtc.NewRTPOpusCodec(webrtc.DefaultPayloadTypeOpus, 48000))
+
+	rtcpfb := []webrtc.RTCPFeedback{
+		webrtc.RTCPFeedback{
+			Type: webrtc.TypeRTCPFBGoogREMB,
+		},
+		// in Section 6.3.1.
+		webrtc.RTCPFeedback{
+			Type:      webrtc.TypeRTCPFBNACK,
+			Parameter: "pli",
+		},
+	}
+
+	mediaEngine.RegisterCodec(webrtc.NewRTPVP8CodecExt(webrtc.DefaultPayloadTypeVP8, 90000, rtcpfb, ""))
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(mediaEngine),
+	)
+
 	peerConnectionConfig := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
+				URLs:           []string{"stun:stun.l.google.com:19302"},
+				CredentialType: webrtc.ICECredentialTypePassword,
+			},
+			{
+				URLs:           []string{"stun:global.stun.twilio.com:3478?transport=udp"},
+				CredentialType: webrtc.ICECredentialTypePassword,
 			},
 		},
 	}
 
-	peerConnection, err := webrtc.NewPeerConnection(peerConnectionConfig)
+	peerConnection, err := api.NewPeerConnection(peerConnectionConfig)
 	if err != nil {
 		return nil, errors.New("unable to create new webrtc PeerConnection")
 	}
 
+	signalService, err := NewSignalService(
+		peerConnection,
+		"__SERVER__",
+		clientId,
+	)
+
 	connector := &Connector{
 		peerConnection: peerConnection,
 		clientID:       clientId,
-		trackEventsCh:  make(chan TrackEvent),
-		rtpStream:      make(chan *rtp.Packet),
+		signalService:  signalService,
+		trackEvents:    make(chan track.Event),
+		rtcpStream:     make(chan rtcp.Packet),
+		localTracks:    make([]*webrtc.Track, 0),
 	}
 
 	if err = connector.initPeer(); err != nil {
@@ -50,85 +86,230 @@ func NewConnector(clientId string) (*Connector, error) {
 	return connector, nil
 }
 
+func (c *Connector) RTCPStream() chan rtcp.Packet {
+	return c.rtcpStream
+}
+
+func (c *Connector) LocalTracks() []*webrtc.Track {
+	return c.localTracks
+}
+
+func (c *Connector) Close() {
+	c.wg.Wait()
+
+	//TODO: add closer of signaler/dataStreamer
+	close(c.rtcpStream)
+	close(c.trackEvents)
+}
+
+func (c *Connector) AddTrack(track *webrtc.Track, rtcpStream chan rtcp.Packet) error {
+	sender, err := c.peerConnection.AddTrack(track)
+	if err != nil {
+		log.Printf("Failed to add new track: ClientID :%s", c.clientID)
+		return err
+	}
+
+	go c.runRTCPListener(sender, rtcpStream)
+
+	return nil
+}
+
+func (c *Connector) ClientID() string {
+	return c.clientID
+}
+
+func (c *Connector) TrackEventsChannel() <-chan track.Event {
+	return c.trackEvents
+}
+
+func (c *Connector) Signal(payload map[string]interface{}) error {
+	return c.signalService.Signal(payload)
+}
+
+func (p *Connector) SignalChannel() <-chan Payload {
+	return p.signalService.SignalChannel()
+}
+
 func (c *Connector) initPeer() error {
 	c.peerConnection.OnICEGatheringStateChange(func(state webrtc.ICEGathererState) {
 		log.Printf("[%s] ICE gathering state changed: %s", c.clientID, state)
 	})
 
-	c.peerConnection.OnTrack()
+	c.peerConnection.OnTrack(c.handleTrack)
 
-	go func() {
-		c.wg.Wait()
-		close(c.rtpStream)
-		close(c.trackEventsCh)
-	}()
-
+	go c.Close()
 	return nil
 }
+func (c *Connector) handleTrack(remote *webrtc.Track, receiver *webrtc.RTPReceiver) {
+	log.Printf("[%s] Remote track: %d", c.clientID, remote.SSRC)
 
-func (p *Connector) handleTrack(track *webrtc.Track, receiver *webrtc.RTPReceiver) {
-	trackInfo := NewTrackInfoFromWebRTC(track)
+	go c.runPLISender()
 
-	rti := remoteTrackInfo{trackInfo, transceiver, receiver, track}
+	trackID := fmt.Sprintf("client-local-track-%s", c.clientID)
 
-	p.addRemoteTrack(rti)
-	p.trackEventsCh <- TrackEvent{
-		TrackInfo: trackInfo,
-		Type:      TrackEventTypeAdd,
+	localTrack, err := c.peerConnection.NewTrack(remote.PayloadType(), remote.SSRC(), trackID, trackID)
+	if err != nil {
+		log.Println("Failed to obtain localTrack from remote, clientID: %s", c.clientID)
 	}
 
-	p.wg.Add(1)
-	go func() {
-		defer func() {
-			p.removeRemoteTrack(trackInfo.SSRC)
-			p.trackEventsCh <- TrackEvent{
-				TrackInfo: trackInfo,
-				Type:      TrackEventTypeRemove,
-			}
+	go c.transmitRTP(remote, localTrack)
 
-			p.wg.Done()
+	c.sendTrackEvent(track.Event{
+		Track: localTrack,
+		Type:  track.EventTypeAdd,
+	})
 
-			prometheusWebRTCTracksActive.Dec()
-			prometheusWebRTCTracksDuration.Observe(time.Now().Sub(start).Seconds())
-		}()
+	c.addLocalTrack(localTrack)
+}
 
-		for {
-			pkt, err := track.ReadRTP()
+func (c *Connector) runPLISender() {
+	var err error
+
+	for pkt := range c.rtcpStream {
+		switch pkt.(type) {
+		case *rtcp.PictureLossIndication:
+			err = c.peerConnection.WriteRTCP([]rtcp.Packet{pkt})
 			if err != nil {
-				p.log.Printf("[%s] Remote track has ended: %d: %s", p.clientID, trackInfo.SSRC, err)
+				log.Printf("Failed to resend PLI to peer connection: %s", c.clientID)
 				return
 			}
-			prometheusRTPPacketsReceived.Inc()
-			prometheusRTPPacketsReceivedBytes.Add(float64(pkt.MarshalSize()))
-			p.rtpLog.Printf("[%s] ReadRTP: %s", p.clientID, pkt)
-			p.rtpCh <- pkt
 		}
-	}()
+	}
+}
+func (c *Connector) transmitRTP(remote, local *webrtc.Track) {
+	var rtpBuf = make([]byte, 1400)
+
+	for {
+		n, err := remote.Read(rtpBuf)
+		if err != nil {
+			log.Printf("Unable to read RTP from remotetrack: clientID: %s", c.clientID)
+			return
+		}
+
+		if _, err = local.Write(rtpBuf[:n]); err != nil && err != io.ErrClosedPipe {
+			log.Printf("Unable to transmit RTP to localtrack: clientID: %s", c.clientID)
+			return
+		}
+	}
 }
 
-func (p *Connector) ClientID() string {
-	return p.clientID
+func (c *Connector) runRTCPListener(sender *webrtc.RTPSender, rtcpStream chan rtcp.Packet) {
+	for {
+		rtcpPackets, err := sender.ReadRTCP()
+		if err != nil {
+			log.Printf("Failed to read RCTP packet, clientID: %s", c.clientID)
+			return
+		}
+		for _, rtcpPacket := range rtcpPackets {
+			rtcpStream <- rtcpPacket
+		}
+	}
 }
 
-func (p *Connector) WriteRTP(packet *rtp.Packet) (bytes int, err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	pta, ok := p.localTracks[packet.SSRC]
-	if !ok {
-		return 0, fmt.Errorf("Track not found: %d", packet.SSRC)
-	}
-	if err != nil {
-		return 0, err
-	}
-	err = pta.track.WriteRTP(packet)
-	if err == io.ErrClosedPipe {
-		// ErrClosedPipe means we don't have any subscribers, this is ok if no peers have connected yet
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-
-	return packet.MarshalSize(), nil
+func (c *Connector) sendTrackEvent(event track.Event) {
+	c.trackEvents <- event
 }
+
+func (c *Connector) addLocalTrack(local *webrtc.Track) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	c.localTracks = append(c.localTracks, local)
+}
+
+//func (c *Connector) RemoveTrack(ssrc uint32) error {
+//	c.mux.Lock()
+//	defer c.mux.Unlock()
+//
+//	pta, ok := c.localTracks[ssrc]
+//	if !ok {
+//		return fmt.Errorf("Track not found: %d", ssrc)
+//	}
+//
+//	err := c.peerConnection.RemoveTrack(pta.Sender())
+//	if err != nil {
+//		return err
+//	}
+//
+//	//c.signaller.Negotiate()
+//
+//	delete(c.localTracks, ssrc)
+//	return nil
+//}
+
+//
+//func (c *Connector) addRemoteTrack(remote track.RemoteInfo) {
+//	c.mux.Lock()
+//	defer c.mux.Unlock()
+//
+//	c.remoteTracks[remote.Info().SSRC] = remote
+//}
+//
+
+//
+//func (c *Connector) removeRemoteTrack(ssrc uint32) {
+//	c.mux.Lock()
+//	defer c.mux.Unlock()
+//
+//	delete(c.remoteTracks, ssrc)
+//}
+//
+//func (c *Connector) getTransceiverByReceiver(receiver *webrtc.RTPReceiver) (transceiver *webrtc.RTPTransceiver) {
+//	for _, tr := range c.peerConnection.GetTransceivers() {
+//		if tr.Receiver() == receiver {
+//			transceiver = tr
+//			break
+//		}
+//	}
+//
+//	return
+//}
+//
+//func (c *Connector) getTransceiverBySender(sender *webrtc.RTPSender) (transceiver *webrtc.RTPTransceiver) {
+//	for _, tr := range c.peerConnection.GetTransceivers() {
+//		if tr.Sender() == sender {
+//			transceiver = tr
+//			break
+//		}
+//	}
+//
+//	return
+//}
+//
+//
+//func (c *Connector) transmitRTP(remote track.RemoteInfo) {
+//	defer c.stopTransmitting(remote.Info())
+//
+//	for {
+//		pkt, err := remote.Track().ReadRTP()
+//		if err != nil {
+//			log.Printf("[%s] Remote track has ended: %d: %s", c.clientID, remote.Info().SSRC, err)
+//			return
+//		}
+//
+//		log.Printf("[%s] ReadRTP: %s", c.clientID, pkt)
+//		c.rtpStream <- pkt
+//	}
+//}
+//
+
+//
+//func (c *Connector) stopTransmitting(info track.Info) {
+//	c.removeRemoteTrack(info.SSRC)
+//	c.sendTrackEvent(track.Event{
+//		Info: info,
+//		Type: track.EventTypeRemove,
+//	})
+//	c.wg.Done()
+//}
+
+//func (p *WebRTCTransport) Signal(payload map[string]interface{}) error {
+//	return p.signaller.Signal(payload)
+//}
+//
+//func (p *WebRTCTransport) SignalChannel() <-chan Payload {
+//	return p.signaller.SignalChannel()
+//}
+//func (p *WebRTCTransport) MessagesChannel() <-chan webrtc.DataChannelMessage {
+//	return p.dataTransceiver.MessagesChannel()
+//}

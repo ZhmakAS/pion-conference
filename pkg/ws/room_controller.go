@@ -20,11 +20,47 @@ func NewRoomControllerService(room string) RoomControllerService {
 	}
 }
 
-func (r *RoomControllerService) Add(client ws.Client) {
+func (r *RoomControllerService) GetReadyClients() (map[string]string, error) {
+	filteredClients := map[string]string{}
+	clients, err := r.Clients()
+	if err != nil {
+		return filteredClients, err
+	}
+	for clientID, nickname := range clients {
+		if nickname != "" {
+			filteredClients[clientID] = nickname
+		}
+	}
+	return filteredClients, nil
+}
+
+func (r *RoomControllerService) Add(client ws.Client) error {
 	r.mux.Lock()
 	clientID := client.ID()
 	r.clients[clientID] = client
+	err := r.broadcast(ws.NewMessageRoomJoin(r.room, clientID, client.Metadata()))
 	r.mux.Unlock()
+	return err
+}
+
+func (r *RoomControllerService) SetMetadata(clientID string, metadata string) (ok bool) {
+	r.mux.Lock()
+	defer r.mux.Unlock()
+	client, ok := r.clients[clientID]
+	if ok {
+		client.SetMetadata(metadata)
+	}
+	return
+}
+
+// Returns clients with metadata
+func (r *RoomControllerService) Clients() (clientIDs map[string]string, err error) {
+	r.mux.RLock()
+	clientIDs = map[string]string{}
+	for clientID, client := range r.clients {
+		clientIDs[clientID] = client.Metadata()
+	}
+	r.mux.RUnlock()
 	return
 }
 

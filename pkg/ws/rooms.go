@@ -13,14 +13,18 @@ type RoomsService struct {
 }
 
 func NewRoomsService() *RoomsService {
-	return &RoomsService{}
+	return &RoomsService{
+		controllers: make(map[string]RoomControllerService),
+	}
 }
 
 func (rs *RoomsService) SetRoomController(roomId string) RoomControllerService {
 	rs.mux.Lock()
 	roomCtrl, ok := rs.controllers[roomId]
 	if !ok {
-		rs.controllers[roomId] = NewRoomControllerService(roomId)
+		newRoomCrl := NewRoomControllerService(roomId)
+		rs.controllers[roomId] = newRoomCrl
+		roomCtrl = newRoomCrl
 	}
 	rs.mux.Unlock()
 	return roomCtrl
