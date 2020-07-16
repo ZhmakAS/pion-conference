@@ -6,27 +6,18 @@ import (
 	"pion-conference/pkg/models/ws"
 	"pion-conference/pkg/webrtc"
 	"sync"
-
-	webrtcc "github.com/pion/webrtc/v3"
 )
 
 type SocketHandler struct {
 	mux sync.Mutex
 
-	room       string
-	clientID   string
-	wsRoomCtrl RoomControllerService
-
-	connector    *webrtc.Connector
-	subscription *Subscription
+	connector *webrtc.Connector
+	subsc     *Subscription
 }
 
-func NewSocketHandler(subsc *Subscription, room, clientID string, roomCtrl RoomControllerService) SocketHandler {
+func NewSocketHandler(subsc *Subscription) SocketHandler {
 	return SocketHandler{
-		subscription: subsc,
-		wsRoomCtrl:   roomCtrl,
-		room:         room,
-		clientID:     clientID,
+		subsc: subsc,
 	}
 }
 
@@ -39,6 +30,10 @@ func (sh *SocketHandler) HandleMessage(message ws.Message) error {
 		return sh.handleReady(message)
 	case "signal":
 		return sh.handleSignal(message)
+
+	case "hangUp":
+		return sh.handleHangUp()
+
 	case "ping":
 		return nil
 	}
@@ -52,81 +47,78 @@ func (sh *SocketHandler) handleReady(message ws.Message) error {
 		return fmt.Errorf("Ready message payload is of wrong type: %T", message.Payload)
 	}
 
-	sh.wsRoomCtrl.SetMetadata(sh.clientID, payload["nickname"].(string))
+	sh.subsc.WsRoomCtrl.SetMetadata(sh.subsc.ClientID, payload["nickname"].(string))
 
-	clients, err := sh.wsRoomCtrl.GetReadyClients()
+	connector, err := webrtc.NewConnector(sh.subsc.ClientID)
 	if err != nil {
-		return fmt.Errorf("Error retreiving ready clients: %w", err)
+		return fmt.Errorf("error creating new webrtc.Connector: %w", err)
 	}
 
-	err = sh.wsRoomCtrl.Broadcast(
-		ws.NewMessage("users", sh.room, map[string]interface{}{
-			"initiator": "__SERVER__",
-			"peerIds":   []string{"__SERVER__"},
-			"nicknames": clients,
-		}),
-	)
-	if err != nil {
-		return fmt.Errorf("Error broadcasting users message: %s", err)
-	}
-
-	connector, err := webrtc.NewConnector(sh.clientID)
-	if err != nil {
-		return fmt.Errorf("Error creating new WebRTCTransport: %w", err)
-	}
 	sh.connector = connector
 
-	roomPeersCtrl := webrtc.NewRoomPeersManager()
+	sh.subsc.WebRtcRoomCtrl.Add(connector)
 
-	roomPeersCtrl.Add(connector)
-	go sh.processLocalSignals(message, connector.SignalChannel())
+	joinMessage := ws.NewMessageRoomJoin(sh.subsc.Room, sh.subsc.ClientID, sh.subsc.WsRoomCtrl.Metadata(sh.subsc.ClientID))
+
+	err = sh.subsc.WsRoomCtrl.Emit(sh.subsc.ClientID, joinMessage)
+	if err != nil {
+		log.Printf("error sending metadata: %s, %s", sh.subsc.ClientID, err)
+		return err
+	}
+
+	go sh.listenConnectorSignals()
 
 	return nil
+}
+
+func (sh *SocketHandler) listenConnectorSignals() {
+	for {
+		select {
+
+		case signal := <-sh.connector.Signals():
+			err := sh.subsc.WsRoomCtrl.Emit(sh.subsc.ClientID, ws.NewMessage("signal", sh.subsc.Room, signal))
+			if err != nil {
+				log.Printf("[%s] error sending local signal: %s", sh.subsc.ClientID, err)
+			}
+
+		case <-sh.connector.Renegotiates():
+			sh.subsc.WebRtcRoomCtrl.RenegotiateAll(sh.connector)
+
+		case msg := <-sh.connector.MessagesChannel():
+			sh.subsc.WebRtcRoomCtrl.BroadCastMessage(msg, sh.connector)
+
+		case <-sh.connector.Closes():
+			sh.subsc.WebRtcRoomCtrl.RemoveClosedTracks(sh.connector)
+			return
+
+		}
+	}
 }
 
 func (sh *SocketHandler) handleSignal(message ws.Message) error {
 	payload, ok := message.Payload.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("[%s] Ignoring signal because it is of unexpected type: %T", sh.clientID, payload)
+		return fmt.Errorf("[%s] Ignoring signal because it is of unexpected type: %T", sh.subsc.ClientID, payload)
 	}
 
 	if sh.connector == nil {
-		return fmt.Errorf("[%s] Ignoring signal '%v' because webRTCTransport is not initialized", sh.clientID, payload)
+		return fmt.Errorf("[%s] Ignoring signal '%v' because webRTCTransport is not initialized", sh.subsc.ClientID, payload)
 	}
 
-	return sh.connector.Signal(payload)
+	return sh.subsc.WebRtcRoomCtrl.ProcessSignal(payload)
 }
 
-func (sh *SocketHandler) processLocalSignals(message ws.Message, signals <-chan webrtc.Payload) {
-	for signal := range signals {
-		if _, ok := signal.Signal.(webrtcc.SessionDescription); ok {
-			err := sh.wsRoomCtrl.Emit(sh.clientID, ws.NewMessage("metadata", sh.room, MetadataPayload{
-				UserID: "__SERVER__",
-			}))
-			if err != nil {
-				log.Printf("[%s] Error sending metadata: %s", sh.clientID, err)
-			}
-		}
-
-		err := sh.wsRoomCtrl.Emit(sh.clientID, ws.NewMessage("signal", sh.room, signal))
-		if err != nil {
-			log.Printf("[%s] Error sending local signal: %s", sh.clientID, err)
-			// TODO abort connection
-		}
+func (sh *SocketHandler) handleHangUp() error {
+	if sh.connector == nil {
+		return nil
 	}
 
-	sh.mux.Lock()
-	defer sh.mux.Unlock()
-	sh.connector = nil
-	log.Printf("[%s] Peer connection closed, emitting hangUp event", sh.clientID)
-	sh.wsRoomCtrl.SetMetadata(sh.clientID, "")
+	defer sh.subsc.WebRtcRoomCtrl.Delete(sh.connector)
 
-	err := sh.wsRoomCtrl.Broadcast(
-		ws.NewMessage("hangUp", sh.room, map[string]string{
-			"userId": sh.clientID,
-		}),
-	)
-	if err != nil {
-		log.Printf("[%s] Error broadcasting hangUp: %s", sh.clientID, err)
+	closeErr := sh.connector.Close()
+	if closeErr != nil {
+		return fmt.Errorf("hangUp: Error closing peer connection: %s", closeErr)
 	}
+
+	return nil
 }

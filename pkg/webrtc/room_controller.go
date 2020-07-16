@@ -1,166 +1,141 @@
 package webrtc
 
 import (
+	"fmt"
 	"log"
 	"sync"
 
-	"pion-conference/pkg/webrtc/track"
+	"github.com/pion/webrtc/v3"
 )
 
 type RoomController struct {
 	mux sync.RWMutex
 
-	connectors     map[string]*Connector
-	clientIDBySSRC map[uint32]string
+	connectors map[string]*Connector
 }
 
-func NewRoomPeersManager() *RoomController {
+func NewRoomController() *RoomController {
 	return &RoomController{
-		connectors:     make(map[string]*Connector),
-		clientIDBySSRC: make(map[uint32]string),
+		connectors: make(map[string]*Connector),
 	}
 }
 
-//Main room translating logic
 func (r *RoomController) Add(connector *Connector) {
-	go r.listenNewTracks(connector)
-	go r.listenAll(connector)
+	r.mux.Lock()
+	r.connectors[connector.ClientID()] = connector
+	r.mux.Unlock()
+}
 
-	//go func() {
-	//	for msg := range transport.MessagesChannel() {
-	//		t.broadcast(transport.ClientID(), msg)
-	//	}
-	//}()
+func (r *RoomController) Delete(connector *Connector) {
+	r.mux.Lock()
+	r.RemoveClosedTracks(connector)
+	delete(r.connectors, connector.ClientID())
+	r.mux.Unlock()
+}
 
+func (r *RoomController) ProcessSignal(payload map[string]interface{}) error {
+	signalPayload, err := NewSignalPayloadFromMap(payload)
+	if err != nil {
+		return fmt.Errorf("error constructing signal from payload: %s", err)
+	}
+
+	switch signal := signalPayload.Signal.(type) {
+	//TODO: we will add new signal types e.g. IceCandidate
+	case webrtc.SessionDescription:
+		return r.handleRemoteSDP(signalPayload, signal)
+	}
+
+	return nil
+}
+
+func (r *RoomController) handleRemoteSDP(payload *Payload, sessionDescription webrtc.SessionDescription) error {
+	if sessionDescription.Type != webrtc.SDPTypeOffer {
+		return fmt.Errorf("unsupported webrtc.SDPType %s", sessionDescription.Type)
+	}
+
+	connector, ok := r.connectors[payload.ClientId]
+	if !ok {
+		return fmt.Errorf("unable to find webrtc.Connector by userId %s", payload.ClientId)
+	}
+
+	if !payload.Renegotiate {
+		return connector.HandleBroadcastRemoteOffer(sessionDescription)
+	}
+
+	return r.renegotiateListenPeer(connector, sessionDescription)
+}
+
+func (r *RoomController) renegotiateListenPeer(conn *Connector, sessionDescription webrtc.SessionDescription) error {
 	r.mux.Lock()
 	defer r.mux.Unlock()
 
-	r.connectors[connector.ClientID()] = connector
-}
+	peerConnection, err := webrtc.NewPeerConnection(PeerConfig)
+	if err != nil {
+		return fmt.Errorf("unable to create new webrtc.PeerConnection:%s", err.Error())
+	}
 
-// listenIncomingTracks listen for new tracks from new connected peers
-func (r *RoomController) listenNewTracks(connector *Connector) {
-	for trackEvent := range connector.TrackEventsChannel() {
-		switch trackEvent.Type {
-		case track.EventTypeAdd:
-			r.addTrack(connector.ClientID(), trackEvent)
+	var tracks []*webrtc.Track
+	for clientID, connector := range r.connectors {
+		if clientID == conn.ClientID() {
+			continue
+		}
+
+		tracks = connector.LocalTracks()
+		for trackId := range connector.LocalTracks() {
+
+			sender, err := peerConnection.AddTrack(tracks[trackId])
+			if err != nil {
+				return fmt.Errorf("unable to add listen track to PeerConnection:%s", err.Error())
+			}
+
+			conn.AddListenTracks(connector.ClientID(), sender)
 		}
 	}
+
+	return conn.HandleListenRemoteOffer(peerConnection, sessionDescription)
 }
 
-// broadcastRTP broadcast RTP traffic to all connected users
-func (r *RoomController) listenAll(connector *Connector) {
+func (r *RoomController) RenegotiateAll(conn *Connector) {
 	r.mux.Lock()
-
-	var err error
-	for otherClientID, otherConnector := range r.connectors {
-		if otherClientID != connector.ClientID() {
-
-			for _, localTrack := range otherConnector.LocalTracks() {
-				if err = connector.AddTrack(localTrack, otherConnector.RTCPStream()); err != nil {
-					log.Printf("Failed to add track to new connected track")
-					return
-				}
-			}
+	for clientID, connector := range r.connectors {
+		if clientID == conn.ClientID() {
+			continue
 		}
+		connector.RenegotiateRequest()
 	}
 
 	r.mux.Unlock()
 }
 
-//addTrack add track for all connected peers from new connected peer
-func (t *RoomController) addTrack(clientID string, event track.Event) {
-	t.mux.Lock()
-	defer t.mux.Unlock()
+func (r *RoomController) BroadCastMessage(message webrtc.DataChannelMessage, conn *Connector) {
+	for clientID, connector := range r.connectors {
+		if clientID == conn.ClientID() {
+			continue
+		}
 
-	for otherClientID, otherConnector := range t.connectors {
-		if otherClientID != clientID {
-			if err := otherConnector.AddTrack(event.Track, event.RTCPStream); err != nil {
-				log.Printf("[%s] MemoryTracksManager.addTrack Error adding track: %s", otherClientID, err)
-				continue
-			}
+		if err := r.sendMessage(message, connector); err != nil {
+			log.Printf("[%s] broadcast error: %s", clientID, err)
 		}
 	}
 }
 
-//func (t *RoomController) getTransportBySSRC(ssrc uint32) (connector *Connector, ok bool) {
-//	t.mux.Lock()
-//	defer t.mux.Unlock()
-//
-//	clientID, ok := t.clientIDBySSRC[ssrc]
-//	if !ok {
-//		return nil, false
-//	}
-//
-//	connector, ok = t.connectors[clientID]
-//	return connector, ok
-//}
+func (r *RoomController) RemoveClosedTracks(conn *Connector) {
+	for clientID, connector := range r.connectors {
+		if clientID == conn.ClientID() {
+			continue
+		}
 
-//func (t *RoomController) GetTracksMetadata(clientID string) (m []track.Metadata, ok bool) {
-//	t.mux.RLock()
-//	defer t.mux.RUnlock()
-//
-//	transport, ok := t.connectors[clientID]
-//	if !ok {
-//		return m, false
-//	}
-//
-//	locals := transport.LocalTracks()
-//	m = make([]track.Metadata, 0, len(locals))
-//	for _, local := range locals {
-//		trackMeta := track.NewTrackMetadataFromTrack(local, t.clientIDBySSRC[local.SSRC])
-//
-//		log.Printf("[%s] GetTracksMetadata: %d %#v", clientID, local.SSRC, trackMeta)
-//		m = append(m, trackMeta)
-//	}
-//
-//	return m, true
-//}
+		if err := connector.RemoveListenTracks(conn.ClientID()); err != nil {
+			log.Printf("unable to remove [%s] tracks from active connector ", conn.ClientID())
+		}
+		connector.RenegotiateRequest()
+	}
+}
 
-//func (t *RoomController) Remove(clientID string) {
-//	log.Printf("removePeer: %s", clientID)
-//	t.mux.Lock()
-//	defer t.mux.Unlock()
-//
-//	delete(t.connectors, clientID)
-//}
+func (r *RoomController) sendMessage(message webrtc.DataChannelMessage, connector *Connector) error {
+	if message.IsString {
+		return connector.SendText(string(message.Data))
+	}
 
-////removeTrack remove track from all connected peers from new connected peer
-//func (t *RoomController) removeTrack(clientID string, track track.Info) {
-//	log.Printf("[%s] removeTrack ssrc: %d from other peers", clientID, track.SSRC)
-//
-//	t.mux.Lock()
-//	defer t.mux.Unlock()
-//
-//	delete(t.clientIDBySSRC, track.SSRC)
-//
-//	for otherClientID, otherTransport := range t.connectors {
-//		if otherClientID != clientID {
-//			err := otherTransport.RemoveTrack(track.SSRC)
-//			if err != nil {
-//				log.Printf("[%s] removeTrack error removing track: %s", clientID, err)
-//			}
-//		}
-//	}
-//}
-
-//func (t *RoomController) broadcast(clientID string, msg webrtc.DataChannelMessage) {
-//	t.mux.Lock()
-//	defer t.mux.Unlock()
-//
-//	for otherClientID, otherPeerInRoom := range t.connectors {
-//		if otherClientID != clientID {
-//			t.log.Printf("[%s] broadcast from %s", otherClientID, clientID)
-//			tr := otherPeerInRoom.dataTransceiver
-//			var err error
-//			if msg.IsString {
-//				err = tr.SendText(string(msg.Data))
-//			} else {
-//				err = tr.Send(msg.Data)
-//			}
-//			if err != nil {
-//				t.log.Printf("[%s] broadcast error: %s", otherClientID, err)
-//			}
-//		}
-//	}
-//}
+	return connector.Send(message.Data)
+}

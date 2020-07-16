@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"pion-conference/api/handlers"
+	"pion-conference/pkg/webrtc"
 	"pion-conference/pkg/ws"
 
 	"github.com/go-chi/chi"
@@ -25,6 +26,7 @@ func main() {
 
 	//should be initialized once at the start of the service
 	ws.InitRoomsService()
+	webrtc.InitRoomsService()
 
 	fmt.Print("Server is running on:3000")
 	http.ListenAndServe(":3000", r)

@@ -3,313 +3,310 @@ package webrtc
 import (
 	"errors"
 	"fmt"
-	"github.com/pion/rtcp"
-	"github.com/pion/webrtc/v3"
 	"io"
 	"log"
-	"pion-conference/pkg/webrtc/track"
 	"sync"
+	"time"
+
+	"github.com/pion/rtcp"
+	"github.com/pion/webrtc/v3"
 )
 
+const PLISendInterval = time.Second * 2
+
+var codecTypes = map[webrtc.RTPCodecType]string{
+	webrtc.RTPCodecTypeAudio: "audio",
+	webrtc.RTPCodecTypeVideo: "video",
+}
+
+var PeerConfig = webrtc.Configuration{
+	ICEServers: []webrtc.ICEServer{
+		{
+			URLs: []string{"stun:stun.l.google.com:19302"},
+		},
+	},
+}
+
 type Connector struct {
-	mux sync.Mutex
-	wg  sync.WaitGroup
+	*MessageBroker
 
-	clientID       string
-	peerConnection *webrtc.PeerConnection
+	mux       sync.Mutex
+	closeOnce sync.Once
+	clientID  string
 
-	signalService *SignalService
-	trackEvents   chan track.Event
-	rtcpStream    chan rtcp.Packet
+	broadCastPeer *webrtc.PeerConnection
+	listenPeer    *webrtc.PeerConnection
 
-	localTracks []*webrtc.Track
+	signals      chan Payload
+	renegotiates chan struct{}
+	closes       chan struct{}
+
+	listenTracks map[string][]*webrtc.RTPSender
+	localTracks  []*webrtc.Track
 }
 
 func NewConnector(clientId string) (*Connector, error) {
-	var mediaEngine webrtc.MediaEngine
-
-	mediaEngine.RegisterCodec(webrtc.NewRTPOpusCodec(webrtc.DefaultPayloadTypeOpus, 48000))
-
-	rtcpfb := []webrtc.RTCPFeedback{
-		webrtc.RTCPFeedback{
-			Type: webrtc.TypeRTCPFBGoogREMB,
-		},
-		// in Section 6.3.1.
-		webrtc.RTCPFeedback{
-			Type:      webrtc.TypeRTCPFBNACK,
-			Parameter: "pli",
-		},
-	}
-
-	mediaEngine.RegisterCodec(webrtc.NewRTPVP8CodecExt(webrtc.DefaultPayloadTypeVP8, 90000, rtcpfb, ""))
-
-	api := webrtc.NewAPI(
-		webrtc.WithMediaEngine(mediaEngine),
-	)
-
-	peerConnectionConfig := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs:           []string{"stun:stun.l.google.com:19302"},
-				CredentialType: webrtc.ICECredentialTypePassword,
-			},
-			{
-				URLs:           []string{"stun:global.stun.twilio.com:3478?transport=udp"},
-				CredentialType: webrtc.ICECredentialTypePassword,
-			},
-		},
-	}
-
-	peerConnection, err := api.NewPeerConnection(peerConnectionConfig)
-	if err != nil {
-		return nil, errors.New("unable to create new webrtc PeerConnection")
-	}
-
-	signalService, err := NewSignalService(
-		peerConnection,
-		"__SERVER__",
-		clientId,
-	)
-
 	connector := &Connector{
-		peerConnection: peerConnection,
-		clientID:       clientId,
-		signalService:  signalService,
-		trackEvents:    make(chan track.Event),
-		rtcpStream:     make(chan rtcp.Packet),
-		localTracks:    make([]*webrtc.Track, 0),
+		clientID:     clientId,
+		localTracks:  make([]*webrtc.Track, 0),
+		signals:      make(chan Payload),
+		renegotiates: make(chan struct{}),
+		closes:       make(chan struct{}),
+		listenTracks: make(map[string][]*webrtc.RTPSender),
 	}
 
-	if err = connector.initPeer(); err != nil {
-
+	if err := connector.initBroadCastPeer(); err != nil {
+		return nil, fmt.Errorf("failed to init broadCast peer connection: %s", err.Error())
 	}
+
+	connector.MessageBroker = NewMessageBroker(connector.broadCastPeer, clientId)
+
 	return connector, nil
 }
 
-func (c *Connector) RTCPStream() chan rtcp.Packet {
-	return c.rtcpStream
+func (c *Connector) Signals() <-chan Payload {
+	return c.signals
+}
+
+func (c *Connector) Renegotiates() <-chan struct{} {
+	return c.renegotiates
+}
+
+func (c *Connector) Closes() <-chan struct{} {
+	return c.closes
 }
 
 func (c *Connector) LocalTracks() []*webrtc.Track {
 	return c.localTracks
 }
 
-func (c *Connector) Close() {
-	c.wg.Wait()
-
-	//TODO: add closer of signaler/dataStreamer
-	close(c.rtcpStream)
-	close(c.trackEvents)
-}
-
-func (c *Connector) AddTrack(track *webrtc.Track, rtcpStream chan rtcp.Packet) error {
-	sender, err := c.peerConnection.AddTrack(track)
-	if err != nil {
-		log.Printf("Failed to add new track: ClientID :%s", c.clientID)
-		return err
-	}
-
-	go c.runRTCPListener(sender, rtcpStream)
-
-	return nil
-}
-
 func (c *Connector) ClientID() string {
 	return c.clientID
 }
 
-func (c *Connector) TrackEventsChannel() <-chan track.Event {
-	return c.trackEvents
-}
-
-func (c *Connector) Signal(payload map[string]interface{}) error {
-	return c.signalService.Signal(payload)
-}
-
-func (p *Connector) SignalChannel() <-chan Payload {
-	return p.signalService.SignalChannel()
-}
-
-func (c *Connector) initPeer() error {
-	c.peerConnection.OnICEGatheringStateChange(func(state webrtc.ICEGathererState) {
-		log.Printf("[%s] ICE gathering state changed: %s", c.clientID, state)
-	})
-
-	c.peerConnection.OnTrack(c.handleTrack)
-
-	go c.Close()
-	return nil
-}
-func (c *Connector) handleTrack(remote *webrtc.Track, receiver *webrtc.RTPReceiver) {
-	log.Printf("[%s] Remote track: %d", c.clientID, remote.SSRC)
-
-	go c.runPLISender()
-
-	trackID := fmt.Sprintf("client-local-track-%s", c.clientID)
-
-	localTrack, err := c.peerConnection.NewTrack(remote.PayloadType(), remote.SSRC(), trackID, trackID)
-	if err != nil {
-		log.Println("Failed to obtain localTrack from remote, clientID: %s", c.clientID)
-	}
-
-	go c.transmitRTP(remote, localTrack)
-
-	c.sendTrackEvent(track.Event{
-		Track: localTrack,
-		Type:  track.EventTypeAdd,
-	})
-
-	c.addLocalTrack(localTrack)
-}
-
-func (c *Connector) runPLISender() {
-	var err error
-
-	for pkt := range c.rtcpStream {
-		switch pkt.(type) {
-		case *rtcp.PictureLossIndication:
-			err = c.peerConnection.WriteRTCP([]rtcp.Packet{pkt})
-			if err != nil {
-				log.Printf("Failed to resend PLI to peer connection: %s", c.clientID)
-				return
-			}
-		}
-	}
-}
-func (c *Connector) transmitRTP(remote, local *webrtc.Track) {
-	var rtpBuf = make([]byte, 1400)
-
-	for {
-		n, err := remote.Read(rtpBuf)
-		if err != nil {
-			log.Printf("Unable to read RTP from remotetrack: clientID: %s", c.clientID)
-			return
-		}
-
-		if _, err = local.Write(rtpBuf[:n]); err != nil && err != io.ErrClosedPipe {
-			log.Printf("Unable to transmit RTP to localtrack: clientID: %s", c.clientID)
-			return
-		}
-	}
-}
-
-func (c *Connector) runRTCPListener(sender *webrtc.RTPSender, rtcpStream chan rtcp.Packet) {
-	for {
-		rtcpPackets, err := sender.ReadRTCP()
-		if err != nil {
-			log.Printf("Failed to read RCTP packet, clientID: %s", c.clientID)
-			return
-		}
-		for _, rtcpPacket := range rtcpPackets {
-			rtcpStream <- rtcpPacket
-		}
-	}
-}
-
-func (c *Connector) sendTrackEvent(event track.Event) {
-	c.trackEvents <- event
-}
-
-func (c *Connector) addLocalTrack(local *webrtc.Track) {
+func (c *Connector) AddListenTracks(clientId string, sender *webrtc.RTPSender) {
 	c.mux.Lock()
 	defer c.mux.Unlock()
 
-	c.localTracks = append(c.localTracks, local)
+	senders, ok := c.listenTracks[clientId]
+	if !ok {
+		senders = make([]*webrtc.RTPSender, 0)
+	}
+	senders = append(senders, sender)
+	c.listenTracks[clientId] = senders
 }
 
-//func (c *Connector) RemoveTrack(ssrc uint32) error {
-//	c.mux.Lock()
-//	defer c.mux.Unlock()
-//
-//	pta, ok := c.localTracks[ssrc]
-//	if !ok {
-//		return fmt.Errorf("Track not found: %d", ssrc)
-//	}
-//
-//	err := c.peerConnection.RemoveTrack(pta.Sender())
-//	if err != nil {
-//		return err
-//	}
-//
-//	//c.signaller.Negotiate()
-//
-//	delete(c.localTracks, ssrc)
-//	return nil
-//}
+func (c *Connector) RemoveListenTracks(clientId string) error {
+	c.mux.Lock()
+	defer c.mux.Unlock()
 
-//
-//func (c *Connector) addRemoteTrack(remote track.RemoteInfo) {
-//	c.mux.Lock()
-//	defer c.mux.Unlock()
-//
-//	c.remoteTracks[remote.Info().SSRC] = remote
-//}
-//
+	senders, ok := c.listenTracks[clientId]
+	if !ok {
+		return fmt.Errorf("listen tracks were not found: %s", clientId)
+	}
 
-//
-//func (c *Connector) removeRemoteTrack(ssrc uint32) {
-//	c.mux.Lock()
-//	defer c.mux.Unlock()
-//
-//	delete(c.remoteTracks, ssrc)
-//}
-//
-//func (c *Connector) getTransceiverByReceiver(receiver *webrtc.RTPReceiver) (transceiver *webrtc.RTPTransceiver) {
-//	for _, tr := range c.peerConnection.GetTransceivers() {
-//		if tr.Receiver() == receiver {
-//			transceiver = tr
-//			break
-//		}
-//	}
-//
-//	return
-//}
-//
-//func (c *Connector) getTransceiverBySender(sender *webrtc.RTPSender) (transceiver *webrtc.RTPTransceiver) {
-//	for _, tr := range c.peerConnection.GetTransceivers() {
-//		if tr.Sender() == sender {
-//			transceiver = tr
-//			break
-//		}
-//	}
-//
-//	return
-//}
-//
-//
-//func (c *Connector) transmitRTP(remote track.RemoteInfo) {
-//	defer c.stopTransmitting(remote.Info())
-//
-//	for {
-//		pkt, err := remote.Track().ReadRTP()
-//		if err != nil {
-//			log.Printf("[%s] Remote track has ended: %d: %s", c.clientID, remote.Info().SSRC, err)
-//			return
-//		}
-//
-//		log.Printf("[%s] ReadRTP: %s", c.clientID, pkt)
-//		c.rtpStream <- pkt
-//	}
-//}
-//
+	var err error
+	for index := range senders {
+		if err = c.listenPeer.RemoveTrack(senders[index]); err != nil {
+			return fmt.Errorf("unable to remove listen sender: %s", clientId)
+		}
+	}
 
-//
-//func (c *Connector) stopTransmitting(info track.Info) {
-//	c.removeRemoteTrack(info.SSRC)
-//	c.sendTrackEvent(track.Event{
-//		Info: info,
-//		Type: track.EventTypeRemove,
-//	})
-//	c.wg.Done()
-//}
+	delete(c.listenTracks, clientId)
 
-//func (p *WebRTCTransport) Signal(payload map[string]interface{}) error {
-//	return p.signaller.Signal(payload)
-//}
-//
-//func (p *WebRTCTransport) SignalChannel() <-chan Payload {
-//	return p.signaller.SignalChannel()
-//}
-//func (p *WebRTCTransport) MessagesChannel() <-chan webrtc.DataChannelMessage {
-//	return p.dataTransceiver.MessagesChannel()
-//}
+	return nil
+}
+
+func (c *Connector) HandleBroadcastRemoteOffer(sessionDescription webrtc.SessionDescription) (err error) {
+	if c.broadCastPeer.ICEConnectionState() == webrtc.ICEConnectionStateConnected {
+		return errors.New("broadCastPeer already in connected state")
+	}
+
+	if err = c.broadCastPeer.SetRemoteDescription(sessionDescription); err != nil {
+		return fmt.Errorf("error setting remote description: %w", err)
+	}
+
+	answer, err := c.broadCastPeer.CreateAnswer(nil)
+	if err != nil {
+		return fmt.Errorf("error creating answer: %w", err)
+	}
+
+	//TODO: should be changed on ICECandidateExchange
+	gatherComplete := webrtc.GatheringCompletePromise(c.broadCastPeer)
+
+	if err := c.broadCastPeer.SetLocalDescription(answer); err != nil {
+		return fmt.Errorf("error setting local description: %w", err)
+	}
+
+	<-gatherComplete
+
+	c.sendSignal(NewSDPPayload(answer, c.clientID))
+	c.RenegotiateRequest()
+
+	return nil
+}
+
+func (c *Connector) RenegotiateRequest() {
+	c.sendSignal(NewRenegotiatePayload(c.clientID))
+}
+
+func (c *Connector) HandleListenRemoteOffer(peerConnection *webrtc.PeerConnection, sessionDescription webrtc.SessionDescription) (err error) {
+	c.listenPeer = peerConnection
+	if err = c.listenPeer.SetRemoteDescription(sessionDescription); err != nil {
+		return fmt.Errorf("error setting remote description: %w", err)
+	}
+
+	answer, err := c.listenPeer.CreateAnswer(nil)
+	if err != nil {
+		return fmt.Errorf("error creating answer: %w", err)
+	}
+
+	//TODO: should be changed on ICECandidateExchange
+	gatherComplete := webrtc.GatheringCompletePromise(c.listenPeer)
+
+	if err := c.listenPeer.SetLocalDescription(answer); err != nil {
+		return fmt.Errorf("error setting local description: %w", err)
+	}
+
+	<-gatherComplete
+
+	c.signals <- NewSDPPayloadWithRenegotiate(answer, c.clientID)
+	return nil
+}
+
+func (c *Connector) OnTrackHandler() func(remoteTrack *webrtc.Track, receiver *webrtc.RTPReceiver) {
+	return func(remoteTrack *webrtc.Track, receiver *webrtc.RTPReceiver) {
+		go c.runPLISender(remoteTrack)
+
+		trackLabel := fmt.Sprintf("pion-%s-%s", codecTypes[remoteTrack.Kind()], c.ClientID())
+
+		localTrack, newTrackErr := c.broadCastPeer.NewTrack(remoteTrack.PayloadType(), remoteTrack.SSRC(), "video", trackLabel)
+		if newTrackErr != nil {
+			panic(newTrackErr)
+		}
+
+		c.localTracks = append(c.localTracks, localTrack)
+		if len(c.localTracks) == len(c.broadCastPeer.GetTransceivers()) {
+			c.askAllNegotiation()
+		}
+
+		go c.transmitRTP(remoteTrack, localTrack)
+	}
+}
+
+func (c *Connector) ICEConnectionStateChangeHandler(connectionState webrtc.ICEConnectionState) {
+	log.Printf("Peer connection state changed: %s %s", c.clientID, connectionState.String())
+	if connectionState == webrtc.ICEConnectionStateClosed ||
+		connectionState == webrtc.ICEConnectionStateDisconnected ||
+		connectionState == webrtc.ICEConnectionStateFailed {
+
+		if err := c.closeBroadCast(); err != nil {
+			log.Printf("unable to close peerConnection: %s", err.Error())
+		}
+	}
+}
+
+func (c *Connector) initBroadCastPeer() (err error) {
+	c.broadCastPeer, err = webrtc.NewPeerConnection(PeerConfig)
+	if err != nil {
+		return fmt.Errorf("unable to create new webrtc.PeerConnection:%s", err.Error())
+	}
+
+	if _, err = c.broadCastPeer.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
+		return fmt.Errorf("unable to add video codec transceiver1:%s", err.Error())
+	}
+
+	c.broadCastPeer.OnICEConnectionStateChange(c.ICEConnectionStateChangeHandler)
+	c.broadCastPeer.OnTrack(c.OnTrackHandler())
+
+	return nil
+}
+
+func (c *Connector) Close() error {
+	if c.listenPeer != nil {
+		if err := c.listenPeer.Close(); err != nil {
+			return fmt.Errorf("unable to close listen peer: %s", err.Error())
+		}
+	}
+
+	return c.closeBroadCast()
+}
+
+func (c *Connector) runPLISender(remote *webrtc.Track) {
+	ticker := time.NewTicker(PLISendInterval)
+	for range ticker.C {
+		if rtcpSendErr := c.broadCastPeer.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: remote.SSRC()}}); rtcpSendErr != nil {
+			log.Printf("[%s] failed to write PLI to broadcast peer", c.clientID)
+
+			if rtcpSendErr == io.ErrClosedPipe {
+				log.Printf("[%s] stop PLI sender,closed pipe: %s", c.clientID, rtcpSendErr.Error())
+			}
+			return
+		}
+	}
+}
+
+func (c Connector) transmitRTP(remote, local *webrtc.Track) {
+	var (
+		rtpBuf = make([]byte, 1400)
+		err    error
+	)
+	for {
+		i, readErr := remote.Read(rtpBuf)
+		if readErr != nil {
+			log.Println("failed to read rtp from remote stream", readErr)
+			return
+		}
+
+		if _, err = local.Write(rtpBuf[:i]); err != nil && err != io.ErrClosedPipe {
+			log.Println("failed to write rtp to local stream", err)
+			return
+		}
+	}
+}
+
+func (c *Connector) closeBroadCast() error {
+	errs := make(chan error)
+	c.closeOnce.Do(func() {
+		var err error
+
+		c.closes <- struct{}{}
+
+		if c.broadCastPeer != nil {
+			if err := c.broadCastPeer.Close(); err != nil {
+				err = fmt.Errorf("unable to close broadCastPeer: %s", err.Error())
+			}
+		}
+
+		close(c.closes)
+		close(c.signals)
+		close(c.renegotiates)
+		errs <- err
+	})
+
+	return <-errs
+}
+
+func (c *Connector) sendSignal(payload Payload) {
+	c.mux.Lock()
+
+	go func() {
+		defer c.mux.Unlock()
+		select {
+		case c.signals <- payload:
+			return
+		}
+	}()
+}
+
+func (c *Connector) askAllNegotiation() {
+	c.mux.Lock()
+
+	go func() {
+		defer c.mux.Unlock()
+		select {
+		case c.renegotiates <- struct{}{}:
+			return
+		}
+	}()
+}

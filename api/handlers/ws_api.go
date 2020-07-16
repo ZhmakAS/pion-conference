@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"pion-conference/pkg/models/api"
+	"pion-conference/pkg/webrtc"
 	"pion-conference/pkg/ws"
 
 	"github.com/gorilla/websocket"
@@ -33,7 +34,7 @@ func (h WsHandler) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		log.Print("upgrade:", err)
 		return
 	}
-	wsService := ws.NewService(ws.GetRoomsService())
+	wsSubcribe := ws.NewSubscribe(ws.GetRoomsService(), webrtc.GetRoomsService())
 
 	apiRoom := api.WsRoomEnter{
 		RoomId:   roomId,
@@ -41,18 +42,18 @@ func (h WsHandler) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		Conn:     conn,
 	}
 
-	subcription, err := wsService.Subscribe(apiRoom)
+	subscription, err := wsSubcribe.Subscribe(apiRoom)
 	if err != nil {
 		log.Print("ws.Service Subscribe error")
 		return
 	}
 
-	socketHandler := ws.NewSocketHandler(subcription, apiRoom.RoomId, apiRoom.ClientId, subcription.Controller)
+	socketHandler := ws.NewSocketHandler(subscription)
 
-	for message := range subcription.Messages {
+	for message := range subscription.Messages {
 		err := socketHandler.HandleMessage(message)
 		if err != nil {
-			log.Printf("[%s] Error handling websocket message: %s", subcription.ClientID, err)
+			log.Printf("[%s] Error handling websocket message: %s", subscription.ClientID, err)
 		}
 	}
 }

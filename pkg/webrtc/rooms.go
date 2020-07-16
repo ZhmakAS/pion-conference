@@ -1,4 +1,4 @@
-package ws
+package webrtc
 
 import (
 	"fmt"
@@ -22,7 +22,7 @@ func (rs *RoomsService) SetRoomController(roomId string) *RoomController {
 	rs.mux.Lock()
 	roomCtrl, ok := rs.controllers[roomId]
 	if !ok {
-		newRoomCrl := NewRoomController(roomId)
+		newRoomCrl := NewRoomController()
 		rs.controllers[roomId] = newRoomCrl
 		roomCtrl = newRoomCrl
 	}

@@ -15,139 +15,96 @@ type (
 	}
 
 	Payload struct {
-		UserID string      `json:"userId"`
-		Signal interface{} `json:"signal"`
+		Renegotiate bool        `json:"renegotiate"`
+		ClientId    string      `json:"clientId"`
+		Signal      interface{} `json:"signal,omitempty"`
 	}
 )
 
-func NewPayloadSDP(userID string, sessionDescription webrtc.SessionDescription) Payload {
+func NewSDPPayload(sessionDescription webrtc.SessionDescription, clientId string) Payload {
 	return Payload{
-		UserID: userID,
-		Signal: sessionDescription,
+		Renegotiate: false,
+		ClientId:    clientId,
+		Signal:      sessionDescription,
 	}
 }
 
-func NewPayloadRenegotiate(userID string) Payload {
+func NewSDPPayloadWithRenegotiate(sessionDescription webrtc.SessionDescription, clientId string) Payload {
 	return Payload{
-		UserID: userID,
-		Signal: Renegotiate{
-			Renegotiate: true,
-		},
+		Renegotiate: true,
+		ClientId:    clientId,
+		Signal:      sessionDescription,
 	}
 }
 
-func NewPayloadFromMap(payload map[string]interface{}) (p Payload, err error) {
-	userID, ok := payload["userId"].(string)
-	if !ok {
-		err = fmt.Errorf("No userId property in payload: %#v", payload)
-		return
-	}
-	signal, ok := payload["signal"].(map[string]interface{})
-	if !ok {
-		err = fmt.Errorf("No signal property in payload: %#v", payload)
-		return
-	}
-
-	var value interface{}
-
-	if candidate, ok := signal["candidate"]; ok {
-		value, err = newCandidate(candidate)
-	} else if _, ok := signal["renegotiate"]; ok {
-		value = newRenegotiate()
-	} else if sdpType, ok := signal["type"]; ok {
-		value, err = newSDP(sdpType, signal)
-	} else {
-		err = fmt.Errorf("Unexpected signal message: %#v", payload)
-		return
-	}
-
-	if err != nil {
-		return
-	}
-
-	p.UserID = userID
-	p.Signal = value
-	return
-}
-
-func newCandidate(candidate interface{}) (c Candidate, err error) {
-	candidateMap, ok := candidate.(map[string]interface{})
-	if !ok {
-		err = fmt.Errorf("Expected candidate to be a map: %#v", candidate)
-		return
-	}
-
-	candidateValue, ok := candidateMap["candidate"]
-	if !ok {
-		err = fmt.Errorf("Expected candidate.candidate %#v", candidate)
-	}
-
-	candidateString, ok := candidateValue.(string)
-	if !ok {
-		err = fmt.Errorf("Expected candidate.candidate to be a string: %#v", candidate)
-		return
-	}
-	sdpMLineIndexValue, ok := candidateMap["sdpMLineIndex"]
-	if !ok {
-		err = fmt.Errorf("Expected candidate.sdpMLineIndex to exist: %#v", sdpMLineIndexValue)
-		return
-	}
-	sdpMLineIndex, ok := sdpMLineIndexValue.(float64)
-	if !ok {
-		err = fmt.Errorf("Expected candidate.sdpMLineIndex be float64: %T", sdpMLineIndexValue)
-		return
-	}
-
-	sdpMid, ok := candidateMap["sdpMid"].(string)
-	var sdpMidPtr *string
-	if ok {
-		sdpMidPtr = &sdpMid
-	}
-
-	sdpMLineIndexUint16 := uint16(sdpMLineIndex)
-	c.Candidate.Candidate = candidateString
-	c.Candidate.SDPMLineIndex = &sdpMLineIndexUint16
-	c.Candidate.SDPMid = sdpMidPtr
-
-	return
-}
-
-func newRenegotiate() Renegotiate {
-	return Renegotiate{
+func NewRenegotiatePayload(clientId string) Payload {
+	return Payload{
+		ClientId:    clientId,
 		Renegotiate: true,
 	}
 }
 
-func newSDP(sdpType interface{}, signal map[string]interface{}) (s webrtc.SessionDescription, err error) {
+func NewSignalPayloadFromMap(rawPayload map[string]interface{}) (*Payload, error) {
+	signal, ok := rawPayload["signal"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("no signal property in payload: %#v", rawPayload)
+	}
+
+	userID, ok := rawPayload["clientId"].(string)
+	if !ok {
+		return nil, fmt.Errorf("No userId property in payload: %#v", rawPayload)
+	}
+
+	isRenegotiate, ok := rawPayload["renegotiate"].(bool)
+	if !ok {
+		return nil, fmt.Errorf("no renegotiate property in payload : %#v", rawPayload)
+	}
+
+	sdpType, ok := signal["type"]
+	if !ok {
+		return nil, fmt.Errorf("unexpected signal message: %#v", rawPayload)
+	}
+
+	sdpSignal, err := newSDP(sdpType, signal)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Payload{
+		Renegotiate: isRenegotiate,
+		Signal:      sdpSignal,
+		ClientId:    userID,
+	}, nil
+}
+
+func newSDP(sdpType interface{}, signal map[string]interface{}) (desc webrtc.SessionDescription, err error) {
 	sdpTypeString, ok := sdpType.(string)
 	if !ok {
-		err = fmt.Errorf("Expected signal.type to be string: %#v", signal)
+		err = fmt.Errorf("expected signal.type to be string: %#v", signal)
 		return
 	}
 
 	sdp, ok := signal["sdp"]
 	if !ok {
-		err = fmt.Errorf("Expected signal.sdp: %#v", signal)
+		err = fmt.Errorf("expected signal.sdp: %#v", signal)
+		return
 	}
 
 	sdpString, ok := sdp.(string)
 	if !ok {
-		err = fmt.Errorf("Expected signal.sdp to be string: %#v", signal)
+		err = fmt.Errorf("expected signal.sdp to be string: %#v", signal)
 		return
 	}
-	s.SDP = sdpString
+	desc.SDP = sdpString
 
 	switch sdpTypeString {
 	case "offer":
-		s.Type = webrtc.SDPTypeOffer
+		desc.Type = webrtc.SDPTypeOffer
 	case "answer":
-		s.Type = webrtc.SDPTypeAnswer
-	case "pranswer":
-		err = fmt.Errorf("Handling of pranswer signal implemented")
-	case "rollback":
-		err = fmt.Errorf("Handling of rollback signal not implemented")
+		desc.Type = webrtc.SDPTypeAnswer
 	default:
 		err = fmt.Errorf("Unknown sdp type: %s", sdpString)
+		return
 	}
 
 	return

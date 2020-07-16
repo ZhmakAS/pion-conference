@@ -45,6 +45,8 @@ func (c *Client) Listen() <-chan Message {
 		for {
 			message, err := c.read()
 			if err != nil {
+				fmt.Println("Error reading ws", err)
+				c.mux.Lock()
 				close(msgChan)
 				c.err = err
 				c.mux.Unlock()
